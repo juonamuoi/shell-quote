@@ -1,0 +1,88 @@
+set -e
+REPO_DIR="$HOME/getpumppilot"
+REPO_URL="https://github.com/Juonamuoi9/getpumppilot.git"
+BRANCH="perf/quick-wins"
+
+if [ -d "$REPO_DIR/.git" ]; then
+  cd "$REPO_DIR"
+  git fetch --all --prune
+else
+  git clone "$REPO_URL" "$REPO_DIR"
+  cd "$REPO_DIR"
+fi
+
+if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+  git switch "$BRANCH"
+else
+  git switch -c "$BRANCH"
+fi
+
+node - <<'NODE'
+const fs = require('fs');
+const pkgPath = 'package.json';
+const tsPath = 'tsconfig.json';
+
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+pkg.scripts = pkg.scripts || {};
+if (!pkg.scripts['build:core']) pkg.scripts['build:core'] = 'vite build';
+if (!pkg.scripts['ci:full']) pkg.scripts['ci:full'] = 'bun run sync:route-seo && bun run gen:asset-og && bun run gen:social-hashes && bun run gen:sitemap && bun run test:security && bun run test:seo:social && vite build && bun run ping:indexing';
+fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+const ts = JSON.parse(fs.readFileSync(tsPath, 'utf8'));
+ts.compilerOptions = ts.compilerOptions || {};
+ts.compilerOptions.incremental = true;
+ts.compilerOptions.tsBuildInfoFile = './node_modules/.cache/tsbuildinfo';
+const excludes = new Set(Array.isArray(ts.exclude) ? ts.exclude : []);
+['src/routeTree.gen.ts', 'src/integrations/supabase/types.ts', 'remotion/**', 'node_modules'].forEach(i => excludes.add(i));
+ts.exclude = [...excludes];
+fs.writeFileSync(tsPath, JSON.stringify(ts, null, 2) + '\n');
+NODE
+
+mkdir -p .github/workflows
+cat > .github/workflows/perf-ci.yml <<'YAML'
+name: perf-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - name: Cache bun + node deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun
+            ~/.cache/bun
+            node_modules
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json','**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+      - name: Install dependencies
+        run: npm install
+      - name: Build core
+        run: npm run build:core
+YAML
+
+npm install
+npm run build:core
+
+if git diff --quiet -- package.json tsconfig.json .github/workflows/perf-ci.yml; then
+  echo "No changes to commit."
+else
+  git add package.json tsconfig.json .github/workflows/perf-ci.yml
+  git commit -m "perf: add fast build, TS incremental cache, and CI cache"
+fi
+
+echo
+echo "git push --set-upstream origin $BRANCH"
+echo "gh pr create --title \"perf: quick wins\" --body \"Add a fast local build path, incremental TypeScript caching, and CI cache.\" --base main"
